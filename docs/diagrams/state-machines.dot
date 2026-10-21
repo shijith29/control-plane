@@ -1,0 +1,64 @@
+digraph states {
+  graph [rankdir=LR, fontname="Inter", bgcolor="white", pad=0.45, nodesep=0.55, ranksep=1.0, newrank=true,
+         label=<<FONT POINT-SIZE="22" FACE="Inter SemiBold" COLOR="#0F172A">State Machines</FONT><BR/><FONT POINT-SIZE="12" COLOR="#64748B">tenants are driven by API calls + terminal task outcomes  ·  tasks are driven by the worker</FONT>>,
+         labelloc=t];
+  node  [fontname="Inter SemiBold", fontsize=13, shape=box, style="rounded,filled", penwidth=1.8, margin="0.28,0.14", fontcolor="#0F172A"];
+  edge  [fontname="Inter", fontsize=11, penwidth=1.8, arrowsize=0.85];
+
+  subgraph cluster_task {
+    label=<<FONT FACE="Inter SemiBold" POINT-SIZE="15" COLOR="#5B21B6">TASK</FONT>   <FONT POINT-SIZE="11" COLOR="#64748B">(forward-only · done / failed are terminal · any update to a terminal task is ignored)</FONT>>;
+    style="rounded,filled"; fillcolor="#FAFAFF"; color="#C4B5FD"; penwidth=1.6; margin=22;
+
+    k_start [shape=circle, label="", width=0.22, style=filled, fillcolor="#0F172A", color="#0F172A"];
+    accepted    [fillcolor="#F1F5F9", color="#64748B"];
+    in_progress [fillcolor="#EDE9FE", color="#7C3AED"];
+    done        [fillcolor="#D1FAE5", color="#059669", peripheries=2];
+    k_failed    [label="failed", fillcolor="#FEE2E2", color="#DC2626", peripheries=2];
+
+    k_start -> accepted [label=<  created by tenant API call  >, color="#334155", fontcolor="#334155"];
+    accepted -> in_progress [label=<  update: in_progress  >, color="#7C3AED", fontcolor="#5B21B6"];
+    in_progress -> done [label=<  update: done  >, color="#059669", fontcolor="#065F46"];
+    in_progress -> k_failed [label=<  update: failed  >, color="#DC2626", fontcolor="#991B1B"];
+    accepted -> done [label=<  done (in_progress lost/late)  >, color="#059669", fontcolor="#065F46", style=dashed];
+    accepted -> k_failed [label=<  failed (in_progress lost/late)  >, color="#DC2626", fontcolor="#991B1B", style=dashed];
+  }
+
+
+  subgraph cluster_tenant {
+    label=<<FONT FACE="Inter SemiBold" POINT-SIZE="15" COLOR="#1E3A8A">TENANT</FONT>>;
+    style="rounded,filled"; fillcolor="#F8FAFC"; color="#CBD5E1"; penwidth=1.6; margin=22;
+
+    t_start [shape=circle, label="", width=0.22, style=filled, fillcolor="#0F172A", color="#0F172A"];
+    provisioning [fillcolor="#DBEAFE", color="#2563EB"];
+    active       [fillcolor="#D1FAE5", color="#059669"];
+    updating     [fillcolor="#DBEAFE", color="#2563EB"];
+    destroying   [fillcolor="#FFEDD5", color="#EA580C"];
+    destroyed    [fillcolor="#E2E8F0", color="#475569", peripheries=2];
+    t_failed     [label="failed", fillcolor="#FEE2E2", color="#DC2626"];
+
+    t_start -> provisioning [label=<  <B>POST</B>  ·  deploy task  >, color="#334155", fontcolor="#334155"];
+    provisioning -> active  [label=<  deploy done  >, color="#059669", fontcolor="#065F46"];
+    active -> updating      [label=<  <B>PATCH</B>  ·  update task  >, color="#334155", fontcolor="#334155"];
+    updating -> active      [label=<  update done  >, color="#059669", fontcolor="#065F46"];
+    active -> destroying    [label=<  <B>DELETE</B>  ·  destroy task  >, color="#334155", fontcolor="#334155"];
+    destroying -> destroyed [label=<  destroy done  >, color="#059669", fontcolor="#065F46"];
+    provisioning -> t_failed [label=<  deploy failed  >, color="#DC2626", fontcolor="#991B1B"];
+    updating -> t_failed    [label=<  update failed  >, color="#DC2626", fontcolor="#991B1B"];
+    destroying -> t_failed  [label=<  destroy failed  >, color="#DC2626", fontcolor="#991B1B", constraint=false];
+    t_failed -> destroying  [label=<  <B>DELETE</B>  ·  destroy task  >, color="#334155", fontcolor="#334155"];
+
+    {rank=same; updating; destroying}
+    {rank=same; t_failed; destroyed}
+  }
+
+  legend [shape=none, style="", margin=0, label=<
+    <TABLE BORDER="0" CELLBORDER="0" CELLSPACING="4" CELLPADDING="3">
+      <TR><TD ALIGN="LEFT"><FONT FACE="Inter SemiBold" POINT-SIZE="12" COLOR="#0F172A">Legend</FONT></TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT FACE="Inter" POINT-SIZE="11" COLOR="#334155">■ dark arrow — API call (creates a task, emits one event)</FONT></TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT FACE="Inter" POINT-SIZE="11" COLOR="#059669">■ green arrow — terminal success applied by consumer</FONT></TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT FACE="Inter" POINT-SIZE="11" COLOR="#DC2626">■ red arrow — terminal failure applied by consumer</FONT></TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT FACE="Inter" POINT-SIZE="11" COLOR="#334155">◎ double border — terminal state</FONT></TD></TR>
+      <TR><TD ALIGN="LEFT"><FONT FACE="Inter" POINT-SIZE="11" COLOR="#334155">- - dashed — tolerated skip when updates arrive out of order</FONT></TD></TR>
+    </TABLE>>];
+  k_failed -> legend [style=invis];
+}

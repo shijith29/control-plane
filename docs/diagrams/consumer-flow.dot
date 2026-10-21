@@ -1,0 +1,49 @@
+digraph consumer {
+  graph [rankdir=TB, fontname="Inter", bgcolor="white", pad=0.45, nodesep=0.5, ranksep=0.42, splines=spline,
+         label=<<FONT POINT-SIZE="22" FACE="Inter SemiBold" COLOR="#0F172A">Inbound Updates Consumer — Decision Flow</FONT><BR/><FONT POINT-SIZE="12" COLOR="#64748B">idempotent · order-tolerant · poison-safe   —   every path ends in exactly one ack / reject</FONT>>,
+         labelloc=t];
+  node  [fontname="Inter", fontsize=12, shape=box, style="rounded,filled", penwidth=1.6, margin="0.22,0.11",
+         fillcolor="#DBEAFE", color="#2563EB", fontcolor="#0F172A"];
+  edge  [fontname="Inter SemiBold", fontsize=10.5, penwidth=1.6, arrowsize=0.75, color="#475569", fontcolor="#334155"];
+
+  recv   [label=<<B>Receive TaskUpdate</B><BR/><FONT POINT-SIZE="10" COLOR="#9A3412">from task_updates (manual ack)</FONT>>, fillcolor="#FFEDD5", color="#EA580C"];
+  parse  [label=<<B>Valid JSON + schema?</B><BR/><FONT POINT-SIZE="10" COLOR="#475569">update_id · task_id · status</FONT>>, shape=diamond, style="filled", fillcolor="#F8FAFC", color="#64748B", margin="0.05,0.05"];
+  begin  [label=<<B>BEGIN transaction</B>>];
+  dedup  [label=<<B>INSERT INTO processed_updates</B><BR/><FONT POINT-SIZE="10" COLOR="#1E40AF">(update_id) ON CONFLICT DO NOTHING</FONT>>];
+  dupq   [label=<<B>Row inserted?</B>>, shape=diamond, style="filled", fillcolor="#F8FAFC", color="#64748B", margin="0.05,0.05"];
+  lock   [label=<<B>SELECT task FOR UPDATE</B><BR/><FONT POINT-SIZE="10" COLOR="#1E40AF">serialises updates for one task</FONT>>];
+  existsq[label=<<B>Task exists?</B>>, shape=diamond, style="filled", fillcolor="#F8FAFC", color="#64748B", margin="0.05,0.05"];
+  fwdq   [label=<<B>Forward transition?</B><BR/><FONT POINT-SIZE="10" COLOR="#475569">rank(new) &gt; rank(current)</FONT>>, shape=diamond, style="filled", fillcolor="#F8FAFC", color="#64748B", margin="0.05,0.05"];
+  apply  [label=<<B>UPDATE task.status</B><BR/><FONT POINT-SIZE="10" COLOR="#1E40AF">task.updated_at = now()</FONT>>];
+  termq  [label=<<B>Terminal?</B><BR/><FONT POINT-SIZE="10" COLOR="#475569">done | failed</FONT>>, shape=diamond, style="filled", fillcolor="#F8FAFC", color="#64748B", margin="0.05,0.05"];
+  tenant [label=<<B>Move tenant</B><BR/><FONT POINT-SIZE="10" COLOR="#1E40AF">deploy/update done → active<BR/>destroy done → destroyed<BR/>any failed → failed<BR/>tenant.version += 1</FONT>>];
+  commit [label=<<B>COMMIT</B>>, fillcolor="#D1FAE5", color="#059669"];
+  ack    [label=<<B>ACK</B>>, shape=box, style="rounded,filled", fillcolor="#059669", color="#047857", fontcolor="white"];
+
+  skip   [label=<<B>No-op</B><BR/><FONT POINT-SIZE="10" COLOR="#5B21B6">duplicate / stale / unknown task<BR/>(log + metric, key stays recorded)</FONT>>, fillcolor="#EDE9FE", color="#7C3AED"];
+  dlq    [label=<<B>REJECT → task_updates.dlq</B><BR/><FONT POINT-SIZE="10" COLOR="#991B1B">poison message, consumer keeps running</FONT>>, fillcolor="#FEE2E2", color="#DC2626"];
+  retry  [label=<<B>ROLLBACK · NACK (requeue)</B><BR/><FONT POINT-SIZE="10" COLOR="#9A3412">transient DB/broker error<BR/>exponential backoff + jitter</FONT>>, fillcolor="#FFEDD5", color="#EA580C"];
+
+  recv -> parse;
+  parse -> begin [label=<  yes  >, color="#059669", fontcolor="#047857"];
+  parse -> dlq   [label=<  no  >, color="#DC2626", fontcolor="#B91C1C"];
+  begin -> dedup -> dupq;
+  dupq -> lock [label=<  yes  >, color="#059669", fontcolor="#047857"];
+  dupq -> skip [label=<  no — already applied  >, color="#7C3AED", fontcolor="#6D28D9"];
+  lock -> existsq;
+  existsq -> fwdq [label=<  yes  >, color="#059669", fontcolor="#047857"];
+  existsq -> skip [label=<  no  >, color="#7C3AED", fontcolor="#6D28D9"];
+  fwdq -> apply  [label=<  yes  >, color="#059669", fontcolor="#047857"];
+  fwdq -> skip   [label=<  no — stale  >, color="#7C3AED", fontcolor="#6D28D9"];
+  apply -> termq;
+  termq -> tenant [label=<  yes  >, color="#059669", fontcolor="#047857"];
+  termq -> commit [label=<  no  >];
+  tenant -> commit;
+  skip -> commit;
+  commit -> ack [color="#059669"];
+  begin -> retry [style=dashed, color="#EA580C", label=<  DB error  >, fontcolor="#C2410C"];
+
+  {rank=same; dupq; skip}
+  {rank=same; parse; dlq}
+  {rank=same; begin; retry}
+}
