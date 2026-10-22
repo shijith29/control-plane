@@ -8,7 +8,7 @@ A control-plane service that provisions customer environments (**tenants**) asyn
 - consumes progress reports from a **worker simulator**, applying them idempotently and tolerating out-of-order delivery.
 
 ```bash
-git clone <this-repo> && cd tenant-control-plane
+git clone <this-repo> && cd control-plane
 make up      # builds & boots Postgres, RabbitMQ, control plane, worker
 make test    # runs the full test suite in an isolated, throw-away stack
 ```
