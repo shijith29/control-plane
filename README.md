@@ -283,7 +283,7 @@ loop every OUTBOX_POLL_INTERVAL_MS:
 |---|---|
 | **Idempotent** | `INSERT INTO processed_updates … ON CONFLICT DO NOTHING` runs in the **same transaction** as the state change. A duplicate inserts nothing, makes no change, and is acked. |
 | **Order-tolerant** | `SELECT … FOR UPDATE` on the task serialises concurrent updates for the same task, and forward-only rank comparison drops stale updates. |
-| **Resilient** | Transient DB errors trigger a rollback, a retry inside the handler with exponential backoff (100 ms → 3 s, 5 attempts), and finally a nack with requeue. Broker disconnects are handled by aio-pika's `connect_robust`, which reconnects with backoff. |
+| **Resilient** | Transient DB errors trigger a rollback, a retry inside the handler with exponential backoff (100 ms → 3 s, 5 attempts), and finally a nack with requeue. Broker disconnects are handled by aio-pika's `connect_robust`, which reconnects and **re-subscribes** consumers. That only works for queues obtained with `declare_queue` (see §13, *Verified failure modes*). While disconnected, `/readyz` returns `503`. |
 | **Poison-safe** | Invalid JSON or schema leads to `reject(requeue=False)`, which sends the message to `task_updates.dlq`. A message that keeps crashing the handler hits the quorum-queue `x-delivery-limit=5` and is dead-lettered too. The consumer loop never exits on a bad message. |
 | **Ack after commit** | The message is acked only after the transaction commits. If the process crashes in between, the message is redelivered and deduplicated by the inbox. |
 
@@ -414,12 +414,14 @@ Every error uses the same machine-readable envelope. Clients should branch on `e
 
 | `error.code` | HTTP | When |
 |---|---|---|
-| `validation_error` | `422` | Bad slug format, empty name, missing `version`, unknown field, or bad cursor. `details.fields` lists each problem. |
+| `validation_error` | `422` | Bad slug format, empty name, missing `version`, unknown field, malformed id in the path, bad filter value, or bad cursor. `details.fields` lists each problem. |
 | `tenant_not_found` | `404` | No tenant with that id. |
 | `task_not_found` | `404` | No task with that id. |
 | `tenant_already_exists` | `409` | The slug is already taken, including by a `destroyed` tenant. |
 | `tenant_update_not_allowed` | `409` | A `PATCH` when the tenant isn't `active`, or a `DELETE` when it isn't `active` or `failed`. `details` includes `current_status`. |
 | `tenant_version_conflict` | `409` | A `PATCH` whose `version` is not the current version. `details` includes both versions. |
+| `not_found` | `404` | Unknown route. |
+| `method_not_allowed` | `405` | Known route, wrong HTTP method (e.g. `PUT /v1/tenants`). |
 | `internal_error` | `500` | An unexpected failure. No stack trace is returned; it is logged with the `request_id`. |
 
 **Precedence on `PATCH`:** `tenant_not_found`, then `tenant_version_conflict`, then `tenant_update_not_allowed`. If the client's version is stale, its view of the status is stale too, so it should re-read first. If its version is current, "not allowed" is the accurate answer.
@@ -434,7 +436,7 @@ Every race in this system is resolved by **one atomic SQL statement**, rather th
 |---|---|---|
 | Two `POST`s with the same slug | `UNIQUE (slug)`. The losing `INSERT` raises `unique_violation`, which is mapped to `tenant_already_exists`. | Exactly one `201`; every other request gets a `409`. |
 | Two `PATCH`es with the same `version` | A conditional update (below). Postgres row locking means the second statement re-checks `version` after the first commits. | Exactly one `202`; the other gets `tenant_version_conflict`. |
-| `PATCH` and `DELETE` at the same time | Both statements are conditional on `status = 'active'`. | One wins; the other gets `tenant_update_not_allowed`. |
+| `PATCH` and `DELETE` at the same time | Both statements are conditional on `status = 'active'`, and both bump `version`. | One wins; the loser gets `tenant_update_not_allowed` or, if it was the `PATCH`, `tenant_version_conflict`. |
 | A `PATCH` racing a worker-applied change | The consumer bumps `version`, so the client's version is now stale. | `tenant_version_conflict`; the client re-reads and retries. |
 | Two consumers applying updates for one task | `SELECT … FOR UPDATE` on the task plus forward-only ranks. | Serialised; the stale update becomes a no-op. |
 | Duplicate delivery processed concurrently | The `processed_updates` primary key. The second insert waits for the first transaction, then conflicts. | Applied once. |
@@ -483,57 +485,66 @@ These rules are proven by `tests/concurrency/` and by the load script `make race
 ```
 tenant-control-plane/
 ├── README.md
-├── Makefile                      # the single entry point for every command
-├── compose.yaml                  # runtime stack: postgres, rabbitmq, migrate, control-plane, worker
-├── compose.test.yaml             # isolated test stack (own postgres + rabbitmq, tmpfs, no ports)
-├── Dockerfile                    # one multi-stage image: control plane, worker, migrate, tools
-├── .env.example                  # local dev values only, copied to .env by `make up`
-├── pyproject.toml                # deps + ruff / mypy / pytest / bandit config
-├── uv.lock
+├── Makefile                       # the single entry point for every command (`make help`)
+├── compose.yaml                   # runtime stack: postgres, rabbitmq, migrate, control-plane, worker
+├── compose.test.yaml              # isolated test stack (own postgres + rabbitmq, tmpfs, no ports)
+├── Dockerfile                     # one image, two targets: `runtime` (non-root) and `dev` (tooling)
+├── .env.example                   # local dev values only, copied to .env by `make up`
+├── .github/workflows/ci.yml       # make quality → make test → make up/demo/race
+├── pyproject.toml                 # deps + ruff / mypy / pytest / coverage / bandit config
+├── uv.lock                        # locked dependency graph
 ├── alembic.ini
 ├── migrations/
-│   ├── env.py
-│   └── versions/
-│       └── 0001_initial_schema.py
+│   ├── env.py                     # async Alembic env; URL from DATABASE_URL
+│   └── versions/0001_initial_schema.py
 ├── src/
 │   ├── control_plane/
-│   │   ├── main.py               # FastAPI app + lifespan: starts relay & consumer tasks
-│   │   ├── config.py             # pydantic-settings, env-driven
+│   │   ├── main.py                # app factory + lifespan: starts broker, relay, consumer
+│   │   ├── service.py             # use cases — one transaction each (tenant + task + outbox)
+│   │   ├── config.py              # pydantic-settings, env-driven
+│   │   ├── timeutil.py            # UTC, millisecond, `…Z` timestamps
+│   │   ├── backoff.py             # exponential backoff with jitter
+│   │   ├── logs.py                # JSON logs with request_id
 │   │   ├── domain/
-│   │   │   ├── states.py         # tenant/task enums, transition tables, rank()  ← pure, no I/O
-│   │   │   └── errors.py         # domain error types → error codes
+│   │   │   ├── states.py          # enums, transition tables, rank — pure, no I/O
+│   │   │   └── errors.py          # domain errors carrying the contract error codes
 │   │   ├── api/
-│   │   │   ├── routes_tenants.py
-│   │   │   ├── routes_tasks.py
-│   │   │   ├── schemas.py        # request/response models, slug regex
-│   │   │   ├── pagination.py     # cursor encode/decode
-│   │   │   └── errors.py         # exception handlers → error envelope
+│   │   │   ├── routes_tenants.py  # CRUD + /tenants/{id}/tasks
+│   │   │   ├── routes_tasks.py    # read-only
+│   │   │   ├── schemas.py         # request/response models, slug regex
+│   │   │   ├── pagination.py      # opaque keyset cursors
+│   │   │   ├── errors.py          # exception handlers → error envelope
+│   │   │   └── deps.py
 │   │   ├── db/
-│   │   │   ├── tables.py         # SQLAlchemy Core table definitions
-│   │   │   ├── tenants_repo.py   # conditional UPDATEs, create (+task +outbox)
-│   │   │   └── tasks_repo.py
+│   │   │   ├── tables.py          # SQLAlchemy Core tables (source for autogenerate)
+│   │   │   ├── engine.py          # engine + constraint-violation helper
+│   │   │   ├── tenants_repo.py    # the conditional UPDATEs
+│   │   │   └── tasks_repo.py      # tasks, outbox, processed_updates
 │   │   ├── messaging/
-│   │   │   ├── topology.py       # exchanges, queues, DLX (shared with worker)
-│   │   │   ├── contracts.py      # TaskEvent / TaskUpdate pydantic models
+│   │   │   ├── topology.py        # exchanges, quorum queues, DLX (shared with worker)
+│   │   │   ├── contracts.py       # TaskEvent / TaskUpdate wire models
+│   │   │   ├── broker.py          # background connect with backoff; never blocks the API
 │   │   │   ├── outbox_relay.py
 │   │   │   └── updates_consumer.py
-│   │   └── tools/
-│   │       └── publish_update.py # CLI to hand-craft TaskUpdates (negative scenarios)
+│   │   └── tools/publish_update.py  # CLI to hand-craft TaskUpdates (negative scenarios)
 │   └── worker/
-│       ├── __main__.py           # argparse: --fail-rate, --min/max-delay-ms, …
-│       └── simulator.py
+│       ├── __main__.py            # CLI: --fail-rate, --min/max-delay-ms, --duplicate-rate, …
+│       └── simulator.py           # plan_for() is pure; Worker does the I/O
 ├── tests/
-│   ├── unit/                     # state machine, schemas, cursor, worker args (no I/O)
-│   ├── integration/              # repo SQL, outbox relay, consumer against real PG + RabbitMQ
-│   ├── concurrency/              # parallel creates / PATCHes / PATCH-vs-DELETE
-│   └── e2e/                      # full stack: create → active, failure, update, destroy
+│   ├── conftest.py                # real Postgres/RabbitMQ fixtures, migrations run once
+│   ├── unit/                      # state machine, validation, cursors, contracts, worker CLI
+│   ├── integration/               # service, HTTP API, outbox relay, update consumer
+│   ├── concurrency/               # parallel creates / PATCHes / PATCH∥DELETE / duplicate deliveries
+│   └── e2e/                       # API + relay + RabbitMQ + worker + consumer, in one process
 ├── scripts/
-│   ├── race.py                   # load/race demo against the running stack (`make race`)
-│   ├── demo.sh                   # happy-path walkthrough (`make demo`)
-│   └── mq/                       # broker-tooling snippets for negative scenarios
+│   ├── wait-ready.sh              # used by `make up`
+│   ├── demo.sh                    # `make demo`
+│   ├── race.py                    # `make race`
+│   ├── quality.sh / audit-deps.sh # `make quality`
+│   └── mq/                        # publish-update.sh, publish-raw.sh, queue-depth.sh
 └── docs/
-    ├── diagrams/                 # diagram sources (.py / .dot), rebuilt by `make diagrams`
-    └── images/                   # rendered PNGs used by this README
+    ├── diagrams/                  # diagram sources (.py / .dot), rebuilt by `make diagrams`
+    └── images/                    # rendered PNGs used by this README
 ```
 
 ---
@@ -549,10 +560,13 @@ make up
 This command:
 
 1. copies `.env.example` to `.env` if `.env` doesn't exist yet;
-2. builds the image;
+2. builds the image (`docker compose up -d --build`);
 3. starts Postgres and RabbitMQ and waits for their health checks;
-4. runs migrations;
-5. starts the control plane and the worker (`docker compose up --build --wait`).
+4. runs migrations in the one-shot `migrate` container;
+5. starts the control plane and the worker;
+6. waits until `GET /readyz` reports the database and broker as ready (`scripts/wait-ready.sh`).
+
+If a host port is already taken, change `HTTP_PORT`, `POSTGRES_PORT`, `RABBITMQ_PORT` or `RABBITMQ_MGMT_PORT` in `.env`.
 
 When it finishes:
 
@@ -567,6 +581,7 @@ When it finishes:
 
 | Command | What it does |
 |---|---|
+| `make help` | List every target. |
 | `make up` | Build and boot everything (idempotent). |
 | `make down` | Stop containers and keep the data volume. |
 | `make clean` | Stop containers and **delete** volumes, for a fresh database. |
@@ -576,7 +591,7 @@ When it finishes:
 | `make worker ARGS="…"` | Restart **only** the worker with new CLI args (see §14). |
 | `make psql` | Open `psql` inside the Postgres container (`make psql q="select …"` runs one query). |
 | `make race` | Run the concurrency demo against the running stack. |
-| `make diagrams` | Re-render the PNGs in `docs/images/`. |
+| `make diagrams` | Re-render the PNGs in `docs/images/` (needs local `python3`, `matplotlib` and Graphviz; docs only). |
 
 ### Persistence check
 
@@ -612,23 +627,23 @@ The rules followed in this repo:
 ### Run everything
 
 ```bash
-make test     # full test suite
-make check    # format check + lint + type check + security scan + full test suite (what CI runs)
+make test     # full test suite (195 tests, ~20 s once images are built)
+make check    # make quality + make test: everything CI runs
 ```
 
-`make test` runs `docker compose -f compose.test.yaml run --rm --build tests`. The suite gets its **own** Postgres and RabbitMQ on `tmpfs`, with no published ports, so it never touches your dev data and runs the same way on any machine. The exit code is passed through, so it fails CI correctly.
+`make test` builds the `dev` image and runs `docker compose -f compose.test.yaml run --rm tests`. The suite gets its **own** Postgres and RabbitMQ on `tmpfs`, with no published ports, so it never touches your dev data and runs the same way on any machine. The exit code is passed through, so it fails CI correctly.
 
-### Quality gates (`make check`)
+### Quality gates (`make quality`)
 
-All of these run inside the `tools` stage of the Docker image, so no local Python is needed.
+All of these run inside the `dev` stage of the Docker image, so no local Python is needed. `make quality` runs them all via `scripts/quality.sh`.
 
 | Gate | Tool | Command |
 |---|---|---|
 | Formatter | `ruff format` | `make fmt` (writes) / `make fmt-check` (CI) |
 | Linter | `ruff check` (pyflakes, pycodestyle, isort, bugbear, pyupgrade, bandit-style `S` rules) | `make lint` |
 | Type checker | `mypy --strict` | `make typecheck` |
-| Security | `bandit -r src` (code) + `pip-audit` (dependencies) | `make security` |
-| Tests + coverage | `pytest` + `pytest-asyncio` + `coverage` (fails under 85%) | `make test` |
+| Security | `bandit -r src` (code) + `pip-audit` on the locked dependencies (`scripts/audit-deps.sh`) | `make security` |
+| Tests + coverage | `pytest` + `pytest-asyncio` + `coverage` (fails under 85%; currently ~90%) | `make test` |
 
 ### What the test suite covers
 
@@ -639,7 +654,7 @@ All of these run inside the `tools` stage of the Docker image, so no local Pytho
 | **Integration**: outbox | an event is published only after commit; **a rollback publishes nothing**; broker down means the row stays pending and is published after the broker recovers; a relay crash between publish and mark causes a re-publish (at-least-once) |
 | **Integration**: consumer | duplicate `update_id` is a no-op and the tenant `version` is unchanged; `in_progress` after `done` is ignored; update for an unknown task is acked and recorded as `unknown_task`; invalid JSON goes to `task_updates.dlq` and the consumer keeps processing; transient DB error is retried and succeeds |
 | **Concurrency** | 50 parallel `POST`s with one slug give exactly one `201`; 50 parallel `PATCH`es with one `version` give exactly one `202`; `PATCH` racing `DELETE` gives exactly one winner; the same update delivered to two consumers in parallel is applied once |
-| **E2E** | create, then `active` (task `accepted → in_progress → done`); worker `--fail-rate=1` leads to `failed`, then `DELETE`, then `destroyed`; `PATCH`, then `updating`, then `active` with `version` bumped; slug of a destroyed tenant cannot be reused |
+| **E2E** | create, then `active` (task `accepted → in_progress → done`); worker `--fail-rate=1` leads to `failed`, then `DELETE`, then `destroyed`; `PATCH`, then `updating`, then `active` with `version` bumped; slug of a destroyed tenant cannot be reused; duplicate and reordered worker output is harmless; poison messages are dead-lettered; writes made while the broker is unreachable are delivered later; consumers re-subscribe after the broker drops every connection |
 
 ### Concurrency demo against the live stack
 
@@ -648,14 +663,63 @@ make race
 ```
 
 ```text
-[create race]  50 concurrent POST slug=race-7f3a  → 201 x1, 409 tenant_already_exists x49   ✔
-[patch race]   50 concurrent PATCH version=2      → 202 x1, 409 tenant_version_conflict x49 ✔
-[patch/delete] PATCH ∥ DELETE                     → 1 winner, 1 tenant_update_not_allowed    ✔
+[create race]  50 x POST slug=race-627d12    -> 201 x1, 409 tenant_already_exists x49                ✔
+[patch race]   50 x PATCH version=2          -> 202 x1, 409 tenant_version_conflict x49              ✔
+[patch/delete] PATCH ∥ DELETE                -> 202 x1, 409 tenant_version_conflict x1               ✔
 ```
+
+The script exits non-zero if any race has more or fewer than one winner.
+
+### Verified failure modes
+
+Two bugs were found by stopping a real RabbitMQ under load, not by unit tests. Both now have regression tests:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| After a broker restart, everything reconnected, but tasks piled up in `tasks` with **0 consumers**. | aio-pika's robust channel only re-subscribes queues it declared. Consuming through `get_queue(name, ensure=False)` returns an untracked handle. | Both consumers subscribe on the queue object returned by `declare_queue`. Test: `test_consumers_resubscribe_after_broker_drops_all_connections`, which fails if the old code is restored. |
+| `/readyz` said the broker was `ok` during an outage. | A robust connection isn't `is_closed` while it's reconnecting. | Readiness checks `connection.connected`. Test: the broker-unreachable e2e test asserts `503`. |
 
 ---
 
-tenant_update_not_allowed`.
+## 14. Reproducing negative scenarios
+
+### A. Worker CLI flags (restart the worker with new behaviour)
+
+The worker reads its flags from `WORKER_ARGS`. Running `make worker ARGS="…"` recreates only the worker container:
+
+```bash
+make worker ARGS="--fail-rate=1"                                # every task fails
+make worker ARGS="--min-delay-ms=20000 --max-delay-ms=30000"    # slow provisioning
+make worker ARGS="--duplicate-rate=1"                           # every update published twice
+make worker ARGS="--reorder-rate=1"                             # sends `done` BEFORE `in_progress`
+make worker                                                     # back to defaults
+# equivalent raw command:
+WORKER_ARGS="--fail-rate=1" docker compose up -d --no-deps --force-recreate worker
+```
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--fail-rate` | `0.0` | Probability (0–1) that a task ends `failed`. |
+| `--min-delay-ms` / `--max-delay-ms` | `500` / `3000` | Uniform random time spent "provisioning". |
+| `--duplicate-rate` | `0.0` | Probability of publishing each update twice (same `update_id`). |
+| `--reorder-rate` | `0.0` | Probability of sending the terminal update before `in_progress`. |
+| `--prefetch` | `4` | How many tasks the worker processes concurrently. |
+
+Every flag can also be set as an environment variable (`WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, …); a flag wins over its variable.
+
+**Failure walkthrough:**
+
+```bash
+make worker ARGS="--fail-rate=1"
+curl -s -X POST localhost:8080/v1/tenants -H 'content-type: application/json' \
+     -d '{"slug":"doomed","name":"Doomed"}'           # → provisioning … → failed
+curl -s -X PATCH localhost:8080/v1/tenants/<id> -H 'content-type: application/json' \
+     -d '{"version":2,"name":"x"}'                    # → 409 tenant_update_not_allowed
+make worker                                           # healthy worker again
+curl -s -X DELETE localhost:8080/v1/tenants/<id>      # failed → destroying → destroyed
+```
+
+**Busy tenant:** with a slow worker, a `PATCH` sent while the tenant is `provisioning` or `updating` returns `409 tenant_update_not_allowed`.
 
 ### B. Publishing directly to the broker
 
@@ -674,7 +738,7 @@ echo "$TASK_ID"
 ```bash
 set -a; source .env; set +a
 curl -s -u "$RABBITMQ_USER:$RABBITMQ_PASSWORD" -H 'content-type: application/json' \
-  -X POST localhost:15672/api/exchanges/%2F/provisioning/publish \
+  -X POST localhost:${RABBITMQ_MGMT_PORT:-15672}/api/exchanges/%2F/provisioning/publish \
   -d '{"properties":{"delivery_mode":2,"content_type":"application/json"},
        "routing_key":"task.update","payload_encoding":"string",
        "payload":"{\"schema_version\":1,\"update_id\":\"11111111-1111-1111-1111-111111111111\",\"task_id\":\"'"$TASK_ID"'\",\"status\":\"done\"}"}'
@@ -683,7 +747,7 @@ curl -s -u "$RABBITMQ_USER:$RABBITMQ_PASSWORD" -H 'content-type: application/jso
 
 The same thing is possible in the UI: http://localhost:15672, then Exchanges → `provisioning` → *Publish message*, with routing key `task.update`.
 
-**Shortcut: the wrapper scripts** in `scripts/mq/` wrap exactly that `curl` call:
+**Shortcut: the wrapper scripts** in `scripts/mq/` wrap exactly that `curl` call (bash + curl only):
 
 ```bash
 scripts/mq/publish-update.sh <task_id> <status> [update_id]   # update_id defaults to a fresh uuid
@@ -691,16 +755,19 @@ scripts/mq/publish-raw.sh '<any text>'                       # for poison messag
 scripts/mq/queue-depth.sh task_updates.dlq                   # message count of a queue
 ```
 
+There is also a Python CLI inside the image, which publishes over AMQP rather than the management API:
+`docker compose exec control-plane python -m control_plane.tools.publish_update --task-id "$TASK_ID" --status done`.
+
 Run the scenarios below **in order** against the same `TASK_ID`:
 
 | # | Scenario | Command | Expected result |
 |---|---|---|---|
-| 1 | **Duplicate** | `scripts/mq/publish-update.sh $TASK_ID done 1111…1111` (the raw `curl` above), then the **same command again** | Task `done`, tenant `active` with `version: 2`. The second delivery is logged as `duplicate` and changes nothing, so the version stays `2`. |
+| 1 | **Duplicate** | `scripts/mq/publish-update.sh $TASK_ID done 11111111-1111-1111-1111-111111111111`, run **twice** (or the raw `curl` above, twice) | Task `done`, tenant `active` with `version: 2`. The second delivery is logged as `duplicate` and changes nothing, so the version stays `2`. |
 | 2 | **Out of order** | `scripts/mq/publish-update.sh $TASK_ID in_progress` | Task stays `done` and the tenant stays `active`. The update is recorded with `outcome = stale`. |
 | 3 | **Update for a terminal task** | `scripts/mq/publish-update.sh $TASK_ID failed` | Ignored as `stale`; the tenant does **not** become `failed`. |
 | 4 | **Unknown task** | `scripts/mq/publish-update.sh 00000000-0000-0000-0000-000000000000 done` | Acked and recorded as `unknown_task`. |
-| 5 | **Poison message** | `scripts/mq/publish-raw.sh 'not json at all'` | `scripts/mq/queue-depth.sh task_updates.dlq` increases by 1, and the consumer keeps running (create another tenant to confirm). |
-| 6 | **Broker outage** | `docker compose stop rabbitmq`, then `POST` a tenant, then `docker compose start rabbitmq` and `docker compose start worker` | `POST` still returns `201` while the broker is down, and the outbox row stays pending. Once the broker is back, the relay publishes it and the tenant becomes `active`. |
+| 5 | **Poison message** | `scripts/mq/publish-raw.sh 'not json at all'` | The message lands in `task_updates.dlq` and the consumer keeps running (create another tenant to confirm). The management API refreshes queue counts every ~5 s, so `queue-depth.sh` may take a moment to show it. |
+| 6 | **Broker outage** | `docker compose start worker`, then `docker compose stop rabbitmq`, then `POST` a tenant, then `docker compose start rabbitmq` | While the broker is down, `POST` still returns `201`, `/readyz` returns `503`, and the outbox row stays pending (`attempts` and `last_error` grow). Once the broker is back, clients reconnect within ~5–15 s, the relay publishes the row, and the tenant becomes `active`. |
 
 Inspect the evidence:
 
@@ -723,12 +790,26 @@ All configuration is through environment variables. `.env.example` holds **local
 | `DATABASE_URL` | built from the above | control plane, migrate |
 | `RABBITMQ_USER` / `RABBITMQ_PASSWORD` | from `.env` | rabbitmq, control plane, worker |
 | `RABBITMQ_URL` | built from the above | control plane, worker |
-| `HTTP_PORT` | `8080` | control plane |
+| `HTTP_PORT` / `POSTGRES_PORT` / `RABBITMQ_PORT` / `RABBITMQ_MGMT_PORT` | `8080` / `5432` / `5672` / `15672` | host port mappings in `compose.yaml` |
+| `DB_POOL_SIZE` / `DB_MAX_OVERFLOW` | `10` / `20` | control plane connection pool |
 | `OUTBOX_POLL_INTERVAL_MS` | `200` | relay |
 | `OUTBOX_BATCH_SIZE` | `100` | relay |
 | `CONSUMER_PREFETCH` | `16` | consumer |
 | `CONSUMER_MAX_RETRIES` | `5` | consumer (in-handler retries before nack) |
 | `LOG_LEVEL` | `INFO` | all (JSON logs with `request_id`, `task_id`, `update_id`) |
 | `WORKER_ARGS` | *(empty)* | worker CLI flags (see §14) |
+| `WORKER_FAIL_RATE`, `WORKER_MIN_DELAY_MS`, `WORKER_MAX_DELAY_MS`, `WORKER_DUPLICATE_RATE`, `WORKER_REORDER_RATE`, `WORKER_PREFETCH` | see §14 | worker (env alternative to the flags) |
+| `TEST_DATABASE_URL` / `TEST_RABBITMQ_URL` / `TEST_RABBITMQ_MGMT_URL` / `REQUIRE_SERVICES` | set by `compose.test.yaml` | test suite only |
 
 ---
+
+## 16. Out of scope / future work
+
+These are deliberately not built, to keep the focus on correctness, as the brief asks:
+
+- **Authentication and authorisation.** There is no auth; you'd add an API gateway or OIDC in front.
+- **Retention jobs** for `outbox` (published rows) and `processed_updates` (older than the broker's redelivery window).
+- **Metrics and tracing.** OpenTelemetry, plus Prometheus counters for outbox lag, DLQ depth and stale-update rate.
+- **Task timeouts and reaper.** Fail tasks stuck in `accepted` or `in_progress` beyond an SLA, so tenants can't stay `provisioning` forever if a worker dies permanently.
+- **`If-Match` / `ETag` support** alongside the body `version`.
+- **Horizontal scaling.** The relay (`SKIP LOCKED`) and consumer (row locks plus inbox) are already safe with multiple replicas; scaling would only need running more containers.
