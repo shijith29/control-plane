@@ -1,5 +1,6 @@
 # secrets / local config
 .env
+.DS_Store
 
 # python
 __pycache__/
