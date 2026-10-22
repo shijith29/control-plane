@@ -655,43 +655,7 @@ make race
 
 ---
 
-## 14. Reproducing negative scenarios
-
-### A. Worker CLI flags (restart the worker with new behaviour)
-
-The worker reads its flags from `WORKER_ARGS`. Running `make worker ARGS="…"` recreates only the worker container:
-
-```bash
-make worker ARGS="--fail-rate=1"                                # every task fails
-make worker ARGS="--min-delay-ms=20000 --max-delay-ms=30000"    # slow provisioning
-make worker ARGS="--duplicate-rate=1"                           # every update published twice
-make worker ARGS="--reorder-rate=1"                             # sends `done` BEFORE `in_progress`
-make worker                                                     # back to defaults
-# equivalent raw command:
-WORKER_ARGS="--fail-rate=1" docker compose up -d --no-deps --force-recreate worker
-```
-
-| Flag | Default | Effect |
-|---|---|---|
-| `--fail-rate` | `0.0` | Probability (0–1) that a task ends `failed`. |
-| `--min-delay-ms` / `--max-delay-ms` | `500` / `3000` | Uniform random time spent "provisioning". |
-| `--duplicate-rate` | `0.0` | Probability of publishing each update twice (same `update_id`). |
-| `--reorder-rate` | `0.0` | Probability of sending the terminal update before `in_progress`. |
-| `--prefetch` | `4` | How many tasks the worker processes concurrently. |
-
-**Failure walkthrough:**
-
-```bash
-make worker ARGS="--fail-rate=1"
-curl -s -X POST localhost:8080/v1/tenants -H 'content-type: application/json' \
-     -d '{"slug":"doomed","name":"Doomed"}'           # → provisioning … → failed
-curl -s -X PATCH localhost:8080/v1/tenants/<id> -H 'content-type: application/json' \
-     -d '{"version":2,"name":"x"}'                    # → 409 tenant_update_not_allowed
-make worker                                           # healthy worker again
-curl -s -X DELETE localhost:8080/v1/tenants/<id>      # failed → destroying → destroyed
-```
-
-**Busy tenant:** with a slow worker, a `PATCH` sent while the tenant is `provisioning` or `updating` returns `409 tenant_update_not_allowed`.
+tenant_update_not_allowed`.
 
 ### B. Publishing directly to the broker
 
@@ -768,14 +732,3 @@ All configuration is through environment variables. `.env.example` holds **local
 | `WORKER_ARGS` | *(empty)* | worker CLI flags (see §14) |
 
 ---
-
-## 16. Out of scope / future work
-
-These are deliberately not built, to keep the focus on correctness, as the brief asks:
-
-- **Authentication and authorisation.** There is no auth; you'd add an API gateway or OIDC in front.
-- **Retention jobs** for `outbox` (published rows) and `processed_updates` (older than the broker's redelivery window).
-- **Metrics and tracing.** OpenTelemetry, plus Prometheus counters for outbox lag, DLQ depth and stale-update rate.
-- **Task timeouts and reaper.** Fail tasks stuck in `accepted` or `in_progress` beyond an SLA, so tenants can't stay `provisioning` forever if a worker dies permanently.
-- **`If-Match` / `ETag` support** alongside the body `version`.
-- **Horizontal scaling.** The relay (`SKIP LOCKED`) and consumer (row locks plus inbox) are already safe with multiple replicas; scaling would only need running more containers.
